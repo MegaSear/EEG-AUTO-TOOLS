@@ -1,37 +1,38 @@
+# gui/slides/slide2_file_selection.py
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog,
-    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QDialog,
-    QFormLayout, QLineEdit, QDialogButtonBox, QLabel, QAbstractItemView
+    QTableWidget, QTableWidgetItem, QHeaderView, QDialog,
+    QFormLayout, QLineEdit, QDialogButtonBox, QLabel, QAbstractItemView,
+    QMessageBox, QSizePolicy
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPointF, QEvent
 import mne
 from gui.slides.slide3_qc import Slide3QC
-from gui.slides.slide4_preprocessing import Slide4Preprocessing
-from PyQt5.QtWidgets import QSizePolicy  # в начало файла, если ещё не импортировано
+# from gui.slides.slide4_preprocessing import Slide4Preprocessing  # Добавим позже
 from mne_bids import BIDSPath, read_raw_bids, get_entity_vals
 import os
+import numpy as np
 
 class QCFilterDialog(QDialog):
-    def __init__(self, thresholds=None):
+    def __init__(self, available_keys, thresholds=None):
         super().__init__()
         self.setWindowTitle("Настройка фильтра QC")
         self.thresholds = thresholds or {}
+        self.available_keys = available_keys
         layout = QFormLayout(self)
         self.inputs = {}
 
-        fields = [
-            "Количество плохих каналов",
-            "Количество мостиковых каналов",
-            "Количество высокоамплитудных",
-            "Количество низкоамплитудных",
-            "Количество шумных каналов"
-        ]
-
-        for field in fields:
-            value = self.thresholds.get(field, "")
+        for key in self.available_keys:
+            value = self.thresholds.get(key, "")
             input_field = QLineEdit(str(value))
-            layout.addRow(field, input_field)
-            self.inputs[field] = input_field
+            layout.addRow(key, input_field)
+            self.inputs[key] = input_field
+
+        self.custom_key = QLineEdit()
+        self.custom_threshold = QLineEdit()
+        layout.addRow("Пользовательский ключ:", self.custom_key)
+        layout.addRow("Порог для ключа:", self.custom_threshold)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -39,125 +40,112 @@ class QCFilterDialog(QDialog):
         layout.addWidget(buttons)
 
     def get_thresholds(self):
-        return {
-            k: int(v.text()) if v.text().isdigit() else float('inf')
-            for k, v in self.inputs.items()
+        thresholds = {
+            k: float(v.text()) if v.text().replace('.', '', 1).isdigit() else float('inf')
+            for k, v in self.inputs.items() if v.text()
         }
-
+        if self.custom_key.text() and self.custom_threshold.text():
+            thresholds[self.custom_key.text()] = float(self.custom_threshold.text()) if self.custom_threshold.text().replace('.', '', 1).isdigit() else float('inf')
+        return thresholds
 
 class Slide2FileSelection(QWidget):
     def __init__(self):
         super().__init__()
         self.files = []
         self.thresholds = {}
+        self.report_columns = {}
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-
         btn_layout = QHBoxLayout()
         self.add_button = QPushButton("Добавить файлы")
         self.add_button.clicked.connect(self.open_file_dialog)
         btn_layout.addWidget(self.add_button)
-
         self.import_bids_button = QPushButton("Импорт из BIDS")
         self.import_bids_button.clicked.connect(self.import_bids_dataset)
         btn_layout.addWidget(self.import_bids_button)
-
         self.filter_button = QPushButton("Настроить фильтр QC")
         self.filter_button.clicked.connect(self.open_filter_dialog)
         btn_layout.addWidget(self.filter_button)
-
         layout.addLayout(btn_layout)
-
         self.table = QTableWidget()
-        self.table.setColumnCount(12)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "Имя файла", "Длительность\n(сек)", "Частота дискретизации\n(Гц)", "Количество каналов",
-            "QC", "Предобработка", "Количество\nмостиковых",
-            "Количество\nвысокоамплитудных", "Количество\nнизкоамплитудных",
-            "Количество шумных", "Итоговое количество\nплохих", "QC результат"
+            "Имя файла", "Длительность\n(сек)", "Частота дискретизации\n(Гц)",
+            "Количество каналов", "QC статус", "Preprocessing статус"
         ])
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-
         self.table.setHorizontalScrollMode(QTableWidget.ScrollPerPixel)
         self.table.setVerticalScrollMode(QTableWidget.ScrollPerPixel)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
+        self.table.setSelectionMode(QAbstractItemView.MultiSelection)
         layout.addWidget(self.table)
-
         run_buttons_layout = QHBoxLayout()
-
         self.run_qc_button = QPushButton("Запустить QC")
         self.run_qc_button.clicked.connect(self.run_qc_for_selected)
         run_buttons_layout.addWidget(self.run_qc_button)
-
         self.run_preproc_button = QPushButton("Запустить Preprocessing")
         self.run_preproc_button.clicked.connect(self.run_preproc_for_selected)
         run_buttons_layout.addWidget(self.run_preproc_button)
-
         layout.addLayout(run_buttons_layout)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.installEventFilter(self)
+
+    def eventFilter(self, source, event):
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Delete:
+            self.delete_selected_files()
+        return super().eventFilter(source, event)
+
+    def delete_selected_files(self):
+        selected_rows = sorted(set(index.row() for index in self.table.selectedIndexes()), reverse=True)
+        if not selected_rows:
+            return
+        msg = QMessageBox()
+        msg.setWindowTitle("Подтверждение удаления")
+        msg.setText(f"Вы уверены, что хотите удалить информацию об обработке {len(selected_rows)} файлов?")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Cancel)
+        if msg.exec_() == QMessageBox.Yes:
+            for row in selected_rows:
+                self.table.removeRow(row)
+                self.files.pop(row)
 
     def bids_path_exists(self, bids_path):
         try:
-            _ = bids_path.fpath  # fpath вызывает ошибку, если путь невалидный
+            _ = bids_path.fpath
             return bids_path.fpath.exists()
         except Exception:
             return False
-        
+
     def import_bids_dataset(self):
         bids_root = QFileDialog.getExistingDirectory(self, "Выберите BIDS-директорию", "")
         if not bids_root:
             return
-
         subjects = get_entity_vals(bids_root, 'subject')
         tasks = get_entity_vals(bids_root, 'task')
-        all_runs = get_entity_vals(bids_root, 'run')  # без фильтров
-
+        all_runs = get_entity_vals(bids_root, 'run')
         for subject in subjects:
             for task in tasks:
-                # отберём только те run, что реально существуют для текущего subject-task
                 runs = []
                 for run in all_runs:
                     bids_path = BIDSPath(subject=subject, task=task, run=run, root=bids_root)
                     if self.bids_path_exists(bids_path):
                         runs.append(run)
-
                 if not runs:
-                    runs = [None]  # если run не задан
-
+                    runs = [None]
                 for run in runs:
                     bids_path = BIDSPath(subject=subject, task=task, run=run, root=bids_root)
                     try:
                         raw = read_raw_bids(bids_path=bids_path, verbose=False)
                         file_path = raw.filenames[0]
-
                         if file_path not in self.files:
                             self.files.append(file_path)
                             self.add_file_to_table(file_path)
                     except Exception as e:
                         print(f"Ошибка чтения {subject}, {task}, run={run}: {e}")
-
-
-    def get_selected_file_paths(self):
-        paths = []
-        for row in range(self.table.rowCount()):
-            checkbox_widget = self.table.cellWidget(row, 6)
-            if checkbox_widget:
-                checkbox = checkbox_widget.findChild(QCheckBox)
-                if checkbox and checkbox.isChecked():
-                    paths.append(self.files[row])
-        return paths
-
-    def run_qc_for_selected(self):
-        selected_files = self.get_selected_file_paths()
-        print("🔍 Запуск QC для:", selected_files)
-
-    def run_preproc_for_selected(self):
-        selected_files = self.get_selected_file_paths()
-        print("⚙ Запуск Preprocessing для:", selected_files)
 
     def open_file_dialog(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -166,7 +154,6 @@ class Slide2FileSelection(QWidget):
             "",
             "Поддерживаемые (*.vhdr *.edf *.set);;Все файлы (*)"
         )
-        
         for file in files:
             if file not in self.files:
                 self.files.append(file)
@@ -182,28 +169,22 @@ class Slide2FileSelection(QWidget):
             duration = "Ошибка"
             sfreq = "Ошибка"
             n_channels = "Ошибка"
-
         row_position = self.table.rowCount()
         self.table.insertRow(row_position)
-
         def set_item(col, value):
             item = QTableWidgetItem(str(value))
             item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             self.table.setItem(row_position, col, item)
-
-        set_item(0, os.path.basename(str(file_path)))
+        set_item(0, os.path.basename(file_path))
         set_item(1, duration)
         set_item(2, sfreq)
         set_item(3, n_channels)
         set_item(4, "None")
         set_item(5, "None")
 
-        # Метрики QC (заполняются позже)
-        for col in range(7, 12):
-            set_item(col, "None")  # пустые значения до QC
-
     def open_filter_dialog(self):
-        dialog = QCFilterDialog(self.thresholds)
+        available_keys = [k for k in self.report_columns.keys() if k.startswith("QC_")]
+        dialog = QCFilterDialog(available_keys, self.thresholds)
         if dialog.exec_():
             self.thresholds = dialog.get_thresholds()
             self.apply_qc_filter()
@@ -211,39 +192,154 @@ class Slide2FileSelection(QWidget):
     def apply_qc_filter(self):
         for row in range(self.table.rowCount()):
             try:
-                values = {
-                    key: int(self.table.item(row, col).text())
-                    for key, col in zip(self.thresholds.keys(), range(7, 12))
-                }
-                passed = all(values[k] <= self.thresholds.get(k, float('inf')) for k in values)
+                n_channels = float(self.table.item(row, 3).text()) if self.table.item(row, 3).text().replace('.', '', 1).isdigit() else 1
+                passed = True
+                for key, threshold in self.thresholds.items():
+                    if key in self.report_columns:
+                        col = self.report_columns[key]
+                        value = float(self.table.item(row, col).text()) if self.table.item(row, col) and self.table.item(row, col).text().replace('.', '', 1).isdigit() else float('inf')
+                        if "channels" in key.lower():
+                            value = value / n_channels * 100
+                        if value > threshold:
+                            passed = False
+                            break
                 result = "✔" if passed else "✖"
             except Exception:
                 result = "✖"
-
             item = QTableWidgetItem(result)
             item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 11, item)
+            self.table.setItem(row, 4, item)
 
     def run_qc_for_selected(self):
-        files_to_qc = [f for i, f in enumerate(self.files)
-                    if self.table.item(i, 4).text() == "None"]  # QC ещё не проводился
+        files_to_qc = [self.files[i] for i in range(len(self.files))
+                       if self.table.item(i, 4).text() == "None"]
+        if not files_to_qc:
+            print("⚠ Нет файлов для QC.")
+            return
         print("🔍 Запуск QC для:", files_to_qc)
-
-        from gui.main_window import MainWindow  # Импорт временный, можно будет передать окно через сигнал
-        mw = self.window()  # Получаем главное окно
+        from gui.main_window import MainWindow
+        mw = self.window()
         if hasattr(mw, 'slides') and isinstance(mw.slides[2], Slide3QC):
             mw.slides[2].set_input_files(files_to_qc)
+            mw.slides[2].start_processing()
 
     def run_preproc_for_selected(self):
-        files_to_proc = []
-        for i, f in enumerate(self.files):
-            result_item = self.table.item(i, 11)
-            if result_item and result_item.text() == "✔":
-                files_to_proc.append(f)
-
+        files_to_proc = [self.files[i] for i in range(len(self.files))
+                         if self.table.item(i, 4).text() == "✔"]
+        if not files_to_proc:
+            print("⚠ Нет файлов, прошедших QC.")
+            return
         print("⚙ Запуск Preprocessing для:", files_to_proc)
-
         from gui.main_window import MainWindow
+        from gui.slides.slide4_preprocessing import Slide4Preprocessing
         mw = self.window()
         if hasattr(mw, 'slides') and isinstance(mw.slides[3], Slide4Preprocessing):
             mw.slides[3].set_input_files(files_to_proc)
+            mw.slides[3].start_processing()
+
+    def update_reports(self, reports_per_file, transform_names):
+        all_keys = set()
+        for file_path, report in reports_per_file.items():
+            for t_name, repo_data in report.items():
+                for key in repo_data.keys():
+                    all_keys.add(f"{t_name}_{key}")
+        current_columns = set(self.report_columns.keys())
+        new_columns = all_keys - current_columns
+        for col_name in new_columns:
+            col_index = self.table.columnCount()
+            self.table.insertColumn(col_index)
+            self.table.setHorizontalHeaderItem(col_index, QTableWidgetItem(col_name))
+            self.report_columns[col_name] = col_index
+        for row, file_path in enumerate(self.files):
+            report = reports_per_file.get(file_path, {})
+            for t_name, repo_data in report.items():
+                for key, value in repo_data.items():
+                    col_name = f"{t_name}_{key}"
+                    if col_name in self.report_columns:
+                        item = QTableWidgetItem(str(value))
+                        item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                        self.table.setItem(row, self.report_columns[col_name], item)
+            if report:
+                # Если отчёт не пустой, проверяем QC статус
+                has_qc = any(col_name.startswith("QC_") for col_name in report)
+                if has_qc:
+                    item = QTableWidgetItem("✔")
+                else:
+                    item = QTableWidgetItem("None")
+            else:
+                # Если отчёта вообще нет, оставляем None
+                item = QTableWidgetItem("None")
+            status_col = 4
+            item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, status_col, item)
+
+    def clear(self):
+        """Очищает все данные слайда."""
+        self.files.clear()
+        self.thresholds.clear()
+        self.report_columns.clear()
+        self.table.clear()
+        self.table.setRowCount(0)
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Имя файла", "Длительность\n(сек)", "Частота дискретизации\n(Гц)",
+            "Количество каналов", "QC статус", "Preprocessing статус"
+        ])
+
+    def serialize(self):
+        """Сериализует данные слайда для сохранения в файл."""
+        data = {
+            "files": self.files,
+            "thresholds": self.thresholds,
+            "report_columns": self.report_columns,
+            "table_data": []
+        }
+        # Получаем заголовки столбцов
+        headers = []
+        for col in range(self.table.columnCount()):
+            header_item = self.table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else "")
+        
+        # Сохраняем данные таблицы
+        for row in range(self.table.rowCount()):
+            row_data = {}
+            for col in range(self.table.columnCount()):
+                item = self.table.item(row, col)
+                row_data[headers[col]] = item.text() if item else ""
+            data["table_data"].append(row_data)
+        return data
+
+    def deserialize(self, data):
+        """Загружает данные слайда из словаря."""
+        self.clear()
+        self.files = data.get("files", [])
+        self.thresholds = data.get("thresholds", {})
+        self.report_columns = data.get("report_columns", {})
+        
+        # Восстанавливаем столбцы таблицы
+        if self.report_columns:
+            self.table.setColumnCount(len(self.report_columns) + 6)
+            headers = [
+                "Имя файла", "Длительность\n(сек)", "Частота дискретизации\n(Гц)",
+                "Количество каналов", "QC статус", "Preprocessing статус"
+            ] + list(self.report_columns.keys())
+            self.table.setHorizontalHeaderLabels(headers)
+
+        # Восстанавливаем данные таблицы
+        table_data = data.get("table_data", [])
+        # Получаем текущие заголовки столбцов
+        headers = []
+        for col in range(self.table.columnCount()):
+            header_item = self.table.horizontalHeaderItem(col)
+            headers.append(header_item.text() if header_item else "")
+        
+        for row_data in table_data:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            for col, header in enumerate(headers):
+                value = row_data.get(header, "")
+                item = QTableWidgetItem(str(value))
+                item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                if col in (4, 5):
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, col, item)

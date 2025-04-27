@@ -8,6 +8,12 @@ from PyQt5.QtCore import Qt, QPointF, QEvent
 from PyQt5.QtGui import QBrush, QColor, QPen, QPainterPath, QKeyEvent
 
 import inspect
+
+import sys
+import os
+lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+sys.path.insert(0, lib_path)
+
 import eeg_auto_tools.transforms as transforms_module
 from eeg_auto_tools.transforms import Transform
 from eeg_auto_tools.transforms import Sequence
@@ -186,7 +192,7 @@ class Slide4Preprocessing(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
 
         self.run_button = QPushButton("▶ Запустить Preprocessing-граф")
-        self.run_button.clicked.connect(self.run_qc_pipeline)
+        self.run_button.clicked.connect(self.run_pipeline)
         right_layout.addWidget(self.run_button)
 
         self.input_block = TransformBlock("InputRaw", Transform)
@@ -252,16 +258,9 @@ class Slide4Preprocessing(QWidget):
                 elif isinstance(item, Edge):
                     self.scene.removeItem(item)
                     self.edges.remove(item)
-
-    def build_transform_sequence(self):
-        graph = {block: [] for block in self.blocks}
-        for edge in self.edges:
-            start = edge.start_item.parentItem()
-            end = edge.end_item.parentItem()
-            graph[start].append(end)
-
+    
+    def _check_connectivity(self, graph):
         visited = set()
-        sorted_blocks = []
 
         def dfs(node):
             if node in visited:
@@ -269,36 +268,102 @@ class Slide4Preprocessing(QWidget):
             visited.add(node)
             for neighbor in graph.get(node, []):
                 dfs(neighbor)
-            if node != self.input_block:
-                sorted_blocks.insert(0, node)
 
         dfs(self.input_block)
-        return sorted_blocks
+        if len(visited) != len(self.blocks):
+            raise ValueError(f"Граф несвязный: посещено {len(visited)} из {len(self.blocks)} узлов, всего {len(self.blocks)}.")
 
-    def run_qc_pipeline(self):
-        ordered_blocks = self.build_transform_sequence()
-        transform_objects = {}
+    def _check_no_cycles(self, graph):
+        visited = set()
+        rec_stack = set()
 
-        for i, block in enumerate(ordered_blocks):
-            try:
-                kwargs = block.params
-                transform = block.transform_class(**kwargs)
-                transform_objects[f"{block.name}_{i}"] = transform
-            except Exception as e:
-                print(f"[!] Ошибка при создании {block.name}: {e}")
-                continue
+        def dfs(node):
+            visited.add(node)
+            rec_stack.add(node)
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited:
+                    if dfs(neighbor):
+                        return True
+                elif neighbor in rec_stack:
+                    return True
+            rec_stack.remove(node)
+            return False
 
-        sequence = Sequence(**transform_objects)
+        if dfs(self.input_block):
+            raise ValueError("Цикл обнаружен в графе!")
 
+    def _find_all_paths(self, graph):
+        paths = []
+        path = []
+
+        def dfs(node):
+            path.append(node)
+            if not graph[node]:  # Если нет детей (лист)
+                paths.append(list(path))
+            else:
+                for neighbor in graph[node]:
+                    dfs(neighbor)
+            path.pop()
+
+        dfs(self.input_block)
+        return paths
+
+    def run_pipeline(self):
         if not hasattr(self, 'input_files'):
             print("⚠ Файлы для обработки не заданы.")
             return
 
+        graph = {block: [] for block in self.blocks}
+        reverse_graph = {block: [] for block in self.blocks}
+
+        for edge in self.edges:
+            start = edge.start_item.parentItem()
+            end = edge.end_item.parentItem()
+            graph[start].append(end)
+            reverse_graph[end].append(start)
+
+        try:
+            self._check_connectivity(graph)
+            self._check_no_cycles(graph)
+        except ValueError as e:
+            print(f"[!] Ошибка в графе: {e}")
+            return
+
+        paths = self._find_all_paths(graph)
+        print(f"🧩 Найдено {len(paths)} путей для обработки.")
+
+        reports_per_file = {}
+
         for file in self.input_files:
             try:
-                print(f"⚙ Обработка: {file}")
+                print(f"⚙ Обработка файла: {file}")
                 raw = mne.io.read_raw(file, preload=True, verbose=False)
-                processed = sequence(raw)
-                print(f"✅ Успешно: {file}")
+
+                file_report = {}
+
+                for idx, path in enumerate(paths):
+                    transforms = []
+                    for block in path[1:]:  # пропускаем InputRaw
+                        kwargs = block.params
+                        transform = block.transform_class(**kwargs)
+                        transforms.append(transform)
+
+                    processed = raw.copy()
+                    for transform in transforms:
+                        processed = transform(processed)
+
+                    # Сбор репортов с этого пути
+                    for transform in transforms:
+                        repo_data, _ = transform.get_report()
+                        if repo_data:
+                            file_report.update(repo_data)
+
+                reports_per_file[file] = file_report
+                print(f"✅ Файл {file} успешно обработан.")
+
             except Exception as e:
                 print(f"[!] Ошибка при обработке {file}: {e}")
+
+        # Передать репорты в Slide2
+        self.window().slides[1].update_preprocessing_reports(reports_per_file)
+

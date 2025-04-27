@@ -9,10 +9,11 @@ import pickle
 import matplotlib.pyplot as plt 
 
 from tqdm import tqdm
+from itertools import chain
 from mne.preprocessing import ICA
 from sklearn.decomposition import PCA         
 from collections import Counter
-from scipy.signal import savgol_filter
+from scipy.signal import savgol_filter, medfilt, wiener
 from mne_icalabel import label_components
 
 from .savers import compared_snr
@@ -20,8 +21,6 @@ from .quality_check import detect_bad_channels, compared_spectrum, compute_bad_e
 from .scenarious import preprocessing_events
 from .metrics import calculate_SN_ratio
 from .craft_events import make_ANT_events, make_RiTi_events, make_CB_events
-from itertools import chain
-
 
 class Transform:
     def __init__(self, report=False):
@@ -37,7 +36,7 @@ class Transform:
             self.repo_images = {}
             self.repo_data = {}
         return inst
-
+    
     def save_report(self, path, pref=''):
         pathes = []
         for key, fig in self.repo_images.items():
@@ -46,6 +45,9 @@ class Transform:
             pathes.append(path_image)
         return pathes
     
+    def get_report(self):
+        return self.repo_data, self.repo_images
+
 
 class Sequence:
     def __init__(self, **transforms):
@@ -63,7 +65,13 @@ class Sequence:
             if cash:
                 self.insts.append(raw)
         return raw
-
+    
+    def get_reports(self):
+        reports = {}
+        for name, transform in self.transforms.items():
+            reports[name] = transform.get_report()
+        return reports 
+    
 
 class PCAEpochs(Transform):
     def __init__(self, n_components=None, whiten=False):
@@ -270,19 +278,51 @@ class FilterBandpass(Transform):
             self.repo_data = {}
         return raw_filtered
 
-
 class StatisticFilter(Transform):
     def __init__(self, method, report=True):
         self.method = method
         self.report = report
-    def fit(self, raw, method, save, vis):
+
+    def fit(self, raw, method):
         raw_filtered = raw.copy()
-        if method=='savgol':
-            data = raw.get_data()
-            for idx, ch in tqdm(enumerate(raw.ch_names), total=len(raw.ch_names)):
-                data[idx] = savgol_filter(data[idx], window_length=20, polyorder=4)
-            raw_filtered._data = data
-        
+        match method:    
+            case 'savgol':
+                data = raw.get_data()
+                for idx, ch in tqdm(enumerate(raw.ch_names), total=len(raw.ch_names)):
+                    data[idx] = savgol_filter(data[idx], window_length=20, polyorder=4)
+                raw_filtered._data = data
+
+            case 'medfilt':
+                kernel_size = 11  # Must be odd, adjust based on sampling rate
+                for idx, ch in tqdm(enumerate(raw.ch_names), total=len(raw.ch_names)):
+                    data[idx] = medfilt(data[idx], kernel_size=kernel_size)
+
+            case 'wiener':
+                mysize = 15  # Window size for local statistics, adjust as needed
+                for idx, ch in tqdm(enumerate(raw.ch_names), total=len(raw.ch_names)):
+                    data[idx] = wiener(data[idx], mysize=mysize)
+
+            case 'moving_avg':
+                window_size = 10  # Adjust based on sampling rate
+                window = np.ones(window_size) / window_size
+                for idx, ch in tqdm(enumerate(raw.ch_names), total=len(raw.ch_names)):
+                    data[idx] = np.convolve(data[idx], window, mode='same')
+
+            case 'robust':
+                for idx, ch in tqdm(enumerate(raw.ch_names), total=len(raw.ch_names)):
+                    signal = data[idx]
+                    # Compute MAD
+                    median = np.median(signal)
+                    mad = np.median(np.abs(signal - median))
+                    threshold = 3 * mad  # Threshold for outlier detection
+                    # Replace outliers with median
+                    outliers = np.abs(signal - median) > threshold
+                    signal[outliers] = median
+                    data[idx] = signal
+
+            case _:
+                raise f"Unknown method: {method}"
+            
         if self.report:
             fig = compared_spectrum(raw, raw_filtered, fmin=0, fmax=100)
             self.repo_images = {'Spectrum': fig}
@@ -331,7 +371,7 @@ class BadChannelsDetector(Transform):
 
 class AutoICA(Transform):
     def __init__(self, n_components='auto', method='picard', max_deleted='auto', 
-                brain_threshold=0, exclude_bads=False, output_dir=None, report=True):
+                brain_threshold=0, exclude_bads=False, report=True):
         self.n_components = n_components
         self.method = method
         self.report = report
@@ -339,7 +379,6 @@ class AutoICA(Transform):
         self.repo_images = {}
         self.max_deleted = max_deleted
         self.brain_threshold = brain_threshold
-        self.output_dir = output_dir
         self.exclude_bads = exclude_bads
 
     def fit(self, raw):
@@ -368,21 +407,9 @@ class AutoICA(Transform):
         labels, probas = ica_labels["labels"], ica_labels['y_pred_proba']
         
         ica_sources = ica.get_sources(raw.copy())
-        ica_sources_data = ica_sources.get_data()
-
-        if self.output_dir:
-            ica.save(os.path.join(self.output_dir, "ica_solution-ica.fif"), overwrite=True)
-
-            components_info = {
-                "labels": labels,
-                "probas": probas,
-                "raw_info": raw.info,
-                "sources": ica_sources_data,
-            }
-
-            with open(os.path.join(self.output_dir, "ICLabel_info.pkl"), "wb") as f:
-                pickle.dump(components_info, f)
-
+        self.sources_data = ica_sources.get_data()
+        self.labels = labels
+        self.probas = probas 
 
         cond = lambda label, proba: label not in ['brain'] or (label in ['brain'] and proba <= self.brain_threshold)
 
@@ -527,7 +554,7 @@ class Raw2Epoch(Transform):
 
 
 class SetMontage(Transform):
-    def __init__(self, montage, elc_file=None, mode='Cz', vis=False, threshold=0.08, interpolate=True):
+    def __init__(self, montage='waveguard64', elc_file=None, mode='Cz', vis=False, threshold=0.08, interpolate=True):
         self.montage = montage
         self.elc_file = elc_file
         self.vis = vis

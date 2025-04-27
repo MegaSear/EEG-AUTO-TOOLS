@@ -4,6 +4,8 @@ import os
 import numpy as np
 import networkx as nx
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from mne.preprocessing import compute_bridged_electrodes
@@ -324,18 +326,14 @@ def sigmoid(x):
 
 def plot_topomap(variable, raw, title, label, vlim):
     """Plot topomap of Variable"""
-    montage = raw.get_montage()
-    ch_pos_dict = montage.get_positions()['ch_pos']
-    ch_pos = np.array([ch_pos_dict[ch_name][:2] for ch_name in raw.ch_names])
     fig, ax = plt.subplots()
     im, _ = mne.viz.plot_topomap(
-                variable, ch_pos, axes=ax, show=False,
+                variable, raw.info, axes=ax, show=False,
                 names=raw.ch_names, cmap='viridis', vlim=vlim)
     ax.set_title(title)
     cbar = plt.colorbar(im, ax=ax, shrink=0.8)
     cbar.set_label(label)
     return fig
-
 
 
 class ENDetector():
@@ -394,7 +392,7 @@ class ENDetector():
 
 
 
-def DNC_SN_ratio(raw, noise_threshold=0.85, optimized=False):  
+def DNC_SN_ratio(raw, noise_threshold=0.85, n_jobs=1):  
     ch_names = raw.ch_names
     original_data = raw.get_data()
 
@@ -410,15 +408,9 @@ def DNC_SN_ratio(raw, noise_threshold=0.85, optimized=False):
         _, snr_db = compute_snr(interpolated_data, noise_data)
         return ch_name, snr_db
 
-    if optimized:
-        results = Parallel(n_jobs=4)(
-            delayed(process_channel)(ch_idx) for ch_idx in range(len(ch_names))
-        )
-    else:
-        results = []
-        for ch_idx in range(len(ch_names)):
-            result = process_channel(ch_idx)
-            results.append(result)
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(process_channel)(ch_idx) for ch_idx in range(len(ch_names))
+    )
     
     snr_probabilities = {}
     bad_channels = []
