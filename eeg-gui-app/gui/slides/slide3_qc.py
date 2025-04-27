@@ -13,6 +13,8 @@ import sys
 import os
 import mne
 import numpy as np
+import pandas as pd  # Добавляем pandas для работы с Parquet
+import pickle  # Для сохранения raw.info
 lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 sys.path.insert(0, lib_path)
 from eeg_auto_tools.transforms import Transform, Sequence
@@ -28,7 +30,7 @@ def get_available_transforms():
 class TransformBlock(QGraphicsRectItem):
     def __init__(self, name, transform_class, block_id=None):
         super().__init__(0, 0, 180, 60)
-        self.block_id = block_id if block_id is not None else id(self)  # Уникальный идентификатор блока
+        self.block_id = block_id if block_id is not None else id(self)
         self.setBrush(QBrush(QColor("#AED6F1")))
         self.setFlag(QGraphicsItem.ItemIsMovable)
         self.setFlag(QGraphicsItem.ItemIsSelectable)
@@ -399,15 +401,41 @@ class Slide3QC(QWidget):
         return paths
 
     def _cache_raw(self, raw, file_path, node_name):
-        cache_file = os.path.join(self.cache_dir, f"{os.path.basename(file_path)}_{node_name}.npz")
-        np.savez_compressed(cache_file, data=raw.get_data(), info=np.array([raw.info], dtype=object))
+        """Сохраняет данные raw в формате Parquet и метаданные в pickle."""
+        # Формируем путь к файлу Parquet
+        cache_base = os.path.join(self.cache_dir, f"{os.path.basename(file_path)}_{node_name}")
+        cache_file = f"{cache_base}.parquet"
+        info_file = f"{cache_base}_info.pkl"
+
+        # Получаем данные (каналы × времена)
+        data = raw.get_data()
+        # Создаём DataFrame, где строки — каналы, столбцы — временные точки
+        df = pd.DataFrame(data, index=raw.ch_names)
+        # Сохраняем DataFrame в Parquet
+        df.to_parquet(cache_file, engine='pyarrow', compression='snappy')
+
+        # Сохраняем raw.info в отдельный файл (pickle)
+        with open(info_file, 'wb') as f:
+            pickle.dump(raw.info, f)
+
+        # Возвращаем путь к Parquet-файлу (основной файл для кэша)
         return cache_file
 
     def _load_cached_raw(self, cache_file):
-        with np.load(cache_file, allow_pickle=True) as data:
-            raw_data = data['data']
-            info = data['info'][0]
-            return mne.io.RawArray(raw_data, info, verbose=False)
+        """Загружает данные из Parquet и метаданные из pickle, воссоздавая raw."""
+        # Путь к файлу с метаданными (заменяем .parquet на _info.pkl)
+        info_file = cache_file.replace('.parquet', '_info.pkl')
+
+        # Загружаем данные из Parquet
+        df = pd.read_parquet(cache_file, engine='pyarrow')
+        raw_data = df.to_numpy()  # Преобразуем обратно в массив (каналы × времена)
+
+        # Загружаем raw.info
+        with open(info_file, 'rb') as f:
+            info = pickle.load(f)
+
+        # Воссоздаём объект RawArray
+        return mne.io.RawArray(raw_data, info, verbose=False)
 
     def start_processing(self):
         if self.is_processing:
@@ -477,22 +505,20 @@ class Slide3QC(QWidget):
         self.is_processing = False
         self.run_button.setEnabled(True)
         self.progress_label.setText("Готов к обработке")
-        self.input_block = None  # Удаляем ссылку на input_block
+        self.input_block = None
 
     def serialize(self):
         """Сериализует данные слайда для сохранения в файл."""
-        # Сохраняем блоки с их уникальными идентификаторами
         blocks_data = []
         for block in self.blocks:
             block_data = {
-                "block_id": block.block_id,  # Сохраняем уникальный идентификатор
+                "block_id": block.block_id,
                 "name": block.name,
                 "pos": {"x": block.pos().x(), "y": block.pos().y()},
                 "params": block.params
             }
             blocks_data.append(block_data)
 
-        # Сохраняем рёбра, используя block_id для идентификации
         edges_data = []
         for edge in self.edges:
             edge_data = {
@@ -503,7 +529,6 @@ class Slide3QC(QWidget):
             }
             edges_data.append(edge_data)
 
-        # Сохраняем кэши
         cache_data = self.cache
 
         return {
@@ -517,9 +542,8 @@ class Slide3QC(QWidget):
         """Загружает данные слайда из словаря."""
         self.clear()
 
-        # Загружаем блоки
         self.available_transforms = get_available_transforms()
-        block_id_to_block = {}  # Словарь для сопоставления block_id с объектами блоков
+        block_id_to_block = {}
         for block_data in data.get("blocks", []):
             name = block_data["name"]
             block_id = block_data["block_id"]
@@ -536,7 +560,6 @@ class Slide3QC(QWidget):
                 self.input_block.setFlag(QGraphicsItem.ItemIsMovable, False)
                 self.input_block.setFlag(QGraphicsItem.ItemIsSelectable, False)
 
-        # Если InputRaw не был найден в сохранённых данных, создаём новый
         if not self.input_block:
             self.input_block = TransformBlock("InputRaw", Transform)
             self.input_block.setBrush(QBrush(QColor("#D5F5E3")))
@@ -546,7 +569,6 @@ class Slide3QC(QWidget):
             self.scene.addItem(self.input_block)
             self.blocks.append(self.input_block)
 
-        # Загружаем рёбра, используя block_id для корректного восстановления
         for edge_data in data.get("edges", []):
             start_block_id = edge_data["start_block_id"]
             end_block_id = edge_data["end_block_id"]
@@ -562,7 +584,6 @@ class Slide3QC(QWidget):
                 else:
                     print(f"⚠ Не удалось восстановить ребро: {start_block.name} -> {end_block.name} (порты недоступны)")
 
-        # Загружаем кэши
         self.cache = data.get("cache", {})
         self.cache_dir = data.get("cache_dir", "cache_qc")
         os.makedirs(self.cache_dir, exist_ok=True)

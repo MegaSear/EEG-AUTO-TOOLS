@@ -29,11 +29,6 @@ class QCFilterDialog(QDialog):
             layout.addRow(key, input_field)
             self.inputs[key] = input_field
 
-        self.custom_key = QLineEdit()
-        self.custom_threshold = QLineEdit()
-        layout.addRow("Пользовательский ключ:", self.custom_key)
-        layout.addRow("Порог для ключа:", self.custom_threshold)
-
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -44,8 +39,6 @@ class QCFilterDialog(QDialog):
             k: float(v.text()) if v.text().replace('.', '', 1).isdigit() else float('inf')
             for k, v in self.inputs.items() if v.text()
         }
-        if self.custom_key.text() and self.custom_threshold.text():
-            thresholds[self.custom_key.text()] = float(self.custom_threshold.text()) if self.custom_threshold.text().replace('.', '', 1).isdigit() else float('inf')
         return thresholds
 
 class Slide2FileSelection(QWidget):

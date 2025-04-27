@@ -131,7 +131,7 @@ def detect_bad_channels(raw, method_noise='auto', method_bridge='auto'):
     elif method_noise == 'lof':
         bad_channels, scores, noised_fig = DNC_lof(raw)
     elif method_noise in ['auto', 'SN_ratio']:
-        bad_channels, scores, noised_fig = DNC_SN_ratio(raw)
+        bad_channels, scores, noised_fig = DNC_SN_ratio(raw, n_jobs=-1)
     else:
         raise ValueError(f"Unknown method_noise '{method_noise}'. Please use 'ransac', 'neighbours', 'psd', 'ed', 'corr' or 'auto'")
 
