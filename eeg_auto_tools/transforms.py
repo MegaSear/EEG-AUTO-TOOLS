@@ -72,6 +72,74 @@ class Sequence:
             reports[name] = transform.get_report()
         return reports 
     
+class RenameChannels(Transform):
+    def __init__(self, channel_mapping=None, report=True):
+        self.channel_mapping = channel_mapping or {}
+        self.report = report
+
+    def fit(self, inst):
+        if not self.channel_mapping:
+            return inst  # Если маппинг пуст, возвращаем без изменений
+        
+        raw = inst.copy()
+        current_channels = raw.ch_names
+        rename_dict = {}
+        
+        # Формируем словарь для переименования только для существующих каналов
+        for old_name, new_name in self.channel_mapping.items():
+            if old_name in current_channels:
+                rename_dict[old_name] = new_name
+            else:
+                print(f"⚠ Канал {old_name} отсутствует в данных, пропускается.")
+
+        if not rename_dict:
+            print("⚠ Нет подходящих каналов для переименования.")
+            return raw
+
+        # Переименовываем каналы
+        raw.rename_channels(rename_dict)
+
+        # Генерируем отчёт, если требуется
+        if self.report:
+            self.repo_data = {
+                "channel_mapping": rename_dict
+            }
+            self.repo_images = {}
+            # Можно добавить визуализацию, например, список каналов до и после
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.text(0.1, 0.9, "Переименованные каналы:", fontsize=12, weight='bold')
+            for i, (old, new) in enumerate(rename_dict.items()):
+                ax.text(0.1, 0.8 - i * 0.1, f"{old} → {new}", fontsize=10)
+            ax.axis('off')
+            self.repo_images["channel_mapping"] = fig
+
+        return raw
+    
+class FilterBandpass(Transform):
+    def __init__(self, l_freq=0.1, h_freq=45, notch_freq=None, 
+                 method='fir', fir_design='firwin', report=True):
+        self.l_freq = l_freq
+        self.h_freq = h_freq
+        self.notch_freq = notch_freq
+        self.method = method
+        self.fir_design = fir_design
+        self.report = report
+        self.repo_images = {}
+        self.repo_data = {}
+
+    def fit(self, raw):
+        raw_filtered = raw.copy()
+        if self.notch_freq:
+            raw_filtered = raw_filtered.notch_filter(freqs=self.notch_freq, method=self.method, fir_design=self.fir_design, 
+                                pad='reflect_limited', phase='zero-double', verbose=False, n_jobs='cuda' if mne.cuda.get_config()['MNE_USE_CUDA']=='true' else -1)
+        raw_filtered = raw_filtered.filter(l_freq=self.l_freq, h_freq=self.h_freq, method=self.method, fir_design=self.fir_design, 
+                        pad='reflect_limited', phase='zero-double', verbose=False, n_jobs='cuda' if mne.cuda.get_config()['MNE_USE_CUDA']=='true' else -1)
+        if self.report:
+            fig = compared_spectrum(raw, raw_filtered, fmin=0, fmax=min(100, raw.info['sfreq']/2))
+            self.repo_images = {'Spectrum': fig}
+            self.repo_data = {}
+        return raw_filtered
+
 
 class PCAEpochs(Transform):
     def __init__(self, n_components=None, whiten=False):
@@ -113,8 +181,9 @@ class PCAEpochs(Transform):
     
 
 class ChannelSelector(Transform):
-    def __init__(self, exclude=None, report=True, eeg=True, meg=False, stim=False, eog=False):
+    def __init__(self, exclude=["EOG", "BIP1"], include=None, report=True, eeg=True, meg=False, stim=False, eog=False):
         self.exclude = exclude
+        self.include = include
         self.repo_data = {}
         self.repo_images = {}
         self.report = report 
@@ -124,8 +193,12 @@ class ChannelSelector(Transform):
         self.eog=eog
 
     def fit(self, raw):
-        dropped = set([ch for ch in raw.ch_names if ch in self.exclude])
-        raw = raw.drop_channels(dropped)
+        if self.include:
+            included = set([ch for ch in raw.ch_names if ch in self.include])
+            raw = raw.pick_channels(included)
+        if self.exclude:
+            dropped = set([ch for ch in raw.ch_names if ch in self.exclude])
+            raw = raw.drop_channels(dropped)
         picks_eeg = mne.pick_types(raw.info, eeg=self.eeg, meg=self.meg, stim=self.stim, eog=self.eog)
         raw = raw.pick(picks_eeg)
         return raw
@@ -252,32 +325,6 @@ class Cropping(Transform):
             self.repo_images = {}
         return raw
 
-
-class FilterBandpass(Transform):
-    def __init__(self, l_freq, h_freq, notch_freq=None, 
-                 method='fir', fir_design='firwin', report=True):
-        self.l_freq = l_freq
-        self.h_freq = h_freq
-        self.notch_freq = notch_freq
-        self.method = method
-        self.fir_design = fir_design
-        self.report = report
-        self.repo_images = {}
-        self.repo_data = {}
-
-    def fit(self, raw):
-        raw_filtered = raw.copy()
-        if self.notch_freq:
-            raw_filtered = raw_filtered.notch_filter(freqs=self.notch_freq, method=self.method, fir_design=self.fir_design, 
-                                pad='reflect_limited', phase='zero-double', verbose=False, n_jobs='cuda' if mne.cuda.get_config()['MNE_USE_CUDA']=='true' else -1)
-        raw_filtered = raw_filtered.filter(l_freq=self.l_freq, h_freq=self.h_freq, method=self.method, fir_design=self.fir_design, 
-                        pad='reflect_limited', phase='zero-double', verbose=False, n_jobs='cuda' if mne.cuda.get_config()['MNE_USE_CUDA']=='true' else -1)
-        if self.report:
-            fig = compared_spectrum(raw, raw_filtered, fmin=0, fmax=min(100, raw.info['sfreq']/2))
-            self.repo_images = {'Spectrum': fig}
-            self.repo_data = {}
-        return raw_filtered
-
 class StatisticFilter(Transform):
     def __init__(self, method, report=True):
         self.method = method
@@ -347,16 +394,17 @@ class Interpolate(Transform):
 
 
 class BadChannelsDetector(Transform):
-    def __init__(self, method_noise='auto', method_bridge='ed', report=True, mark=True):
+    def __init__(self, method_noise='auto', method_bridge='ed', n_jobs=3, report=True, mark=True):
         self.method_noise = method_noise
         self.method_bridge = method_bridge
         self.bad_channels = []
         self.electrodesD = {}
         self.report = report
         self.mark = mark
+        self.n_jobs = n_jobs
 
     def fit(self, raw):
-        self.electrodesD, clusters, bridge_figs, noised_fig = detect_bad_channels(raw.copy(), self.method_noise, self.method_bridge)
+        self.electrodesD, clusters, bridge_figs, noised_fig = detect_bad_channels(raw, self.method_noise, self.method_bridge, self.n_jobs)
         bad_channels = [ch for sublist in self.electrodesD.values() for ch in sublist]
         united_bad_channels = list(set(bad_channels) | set(raw.info['bads']))
         if self.mark:
@@ -366,6 +414,10 @@ class BadChannelsDetector(Transform):
             self.repo_images = {'Bridged_channels': bridge_figs[0], 'Bridged_hist': bridge_figs[1], 
                                 'Noised_channels': noised_fig}
             self.repo_data = {**{'Clusters': clusters}, **self.electrodesD, **{'FINAL': united_bad_channels}}
+            self.repo_data['N_HighAmp'] =  len(self.repo_data['HighAmp'])
+            self.repo_data['N_LowAmp'] = len(self.repo_data['LowAmp'])
+            self.repo_data['N_Bridged'] = len(self.repo_data['Bridged'])
+            self.repo_data['N_Noise_Rate'] = len(self.repo_data['Noise_Rate'])
         return raw
 
 
@@ -383,7 +435,7 @@ class AutoICA(Transform):
 
     def fit(self, raw):
         if self.n_components == 'auto':
-            rank = len(raw.ch_names)
+            rank = len(raw.ch_names) - 1
             self.n_components=rank
         
         if self.n_components == 'auto' and self.exclude_bads:
@@ -394,12 +446,12 @@ class AutoICA(Transform):
             picks = mne.pick_channels(ch_names=raw.info['ch_names'], include=[], exclude=raw.info["bads"])
         else:
             picks = mne.pick_channels(ch_names=raw.info['ch_names'], include=[])
-
+        
         ica = ICA(n_components=self.n_components, fit_params=dict(ortho=False, extended=True),
                 method=self.method, random_state=97, verbose=False)
         
         ica.fit(raw, picks=picks, verbose=False)
-
+        
         mne.set_log_level('ERROR') 
         ica_labels = label_components(raw, ica, method='iclabel')
 
@@ -423,7 +475,14 @@ class AutoICA(Transform):
         exclude_idx    = [idx   for idx, (label, proba) in enumerate(zip(labels, probas)) if cond(label, proba)][:MAX_DELETED_COMP]
         exclude_labels = [label for idx, (label, proba) in enumerate(zip(labels, probas)) if cond(label, proba)][:MAX_DELETED_COMP]
 
-        raw_filtered = ica.apply(raw.copy(), exclude=exclude_idx, verbose=False)
+        
+        raw_for_apply = raw.copy().pick(picks)
+        raw_for_apply.info['bads'] = []
+        raw_filtered_partial = ica.apply(raw_for_apply, exclude=exclude_idx, verbose=False)
+
+        raw_filtered = raw.copy()
+        raw_filtered._data[picks, :] = raw_filtered_partial._data
+
         self.repo_images = {}
 
         if self.report:
@@ -443,7 +502,8 @@ class AutoICA(Transform):
             spec_fig = compared_spectrum(raw.copy().pick(picks), raw_filtered.copy().pick(picks), 
                                         fmin=0, fmax=min(100, raw.info['sfreq']/2))
             self.repo_images['Spectrum'] = spec_fig
-            self.repo_data = {'exclude_idx': exclude_idx, 'exclude_labels': exclude_labels}
+            self.repo_data = {'exclude_idx': exclude_idx, 'exclude_labels': exclude_labels, 
+                              'N_exclude_idx': len(exclude_idx)}
 
         return raw_filtered
 

@@ -110,7 +110,7 @@ def DNC_lof(raw):
 
     return bad_channels, scores, fig
 
-def detect_bad_channels(raw, method_noise='auto', method_bridge='auto'):
+def detect_bad_channels(raw, method_noise='auto', method_bridge='auto', n_jobs=4):
     bad_channels = []
     electrodesD = {}
 
@@ -120,18 +120,20 @@ def detect_bad_channels(raw, method_noise='auto', method_bridge='auto'):
     clusters, bridge_figs, bridged_idx = search_bridge_cluster(raw, method=method_bridge)
     bridged_electrodes = list(set(list(chain.from_iterable(clusters))))
     
-    raw = mne.preprocessing.interpolate_bridged_electrodes(raw, bridged_idx, bad_limit=len(raw.ch_names))
+    mne.set_log_level("ERROR")
+    interpolated_raw = mne.preprocessing.interpolate_bridged_electrodes(raw.copy(), bridged_idx, bad_limit=len(raw.ch_names))
+    mne.set_log_level("WARNING")
 
     if method_noise == 'ransac':
-        bad_channels, scores, noised_fig = DNC_ransac(raw)
+        bad_channels, scores, noised_fig = DNC_ransac(interpolated_raw)
     elif method_noise == 'ed':
-        bad_channels, scores, noised_fig = DNC_electrical_distance(raw)
+        bad_channels, scores, noised_fig = DNC_electrical_distance(interpolated_raw)
     elif method_noise == 'corr':
-        bad_channels, scores, noised_fig = DNC_corr(raw)
+        bad_channels, scores, noised_fig = DNC_corr(interpolated_raw)
     elif method_noise == 'lof':
-        bad_channels, scores, noised_fig = DNC_lof(raw)
+        bad_channels, scores, noised_fig = DNC_lof(interpolated_raw)
     elif method_noise in ['auto', 'SN_ratio']:
-        bad_channels, scores, noised_fig = DNC_SN_ratio(raw, n_jobs=-1)
+        bad_channels, scores, noised_fig = DNC_SN_ratio(interpolated_raw, n_jobs=n_jobs)
     else:
         raise ValueError(f"Unknown method_noise '{method_noise}'. Please use 'ransac', 'neighbours', 'psd', 'ed', 'corr' or 'auto'")
 
@@ -147,6 +149,7 @@ def get_lowamp_channels(raw, threshold_min=3e-6, threshold_length=0.5):
     ch_names = np.array(raw.ch_names)
     empty_scores = np.array([np.mean(np.abs(data[idx]) < threshold_min) for idx, ch in enumerate(ch_names)])
     empty_channels = np.array(ch_names[empty_scores > threshold_length])
+    del data
     return empty_channels, empty_scores
 
 def get_highamp_channels(raw, threshold_max=300e-6, threshold_length=0.5):
@@ -154,6 +157,7 @@ def get_highamp_channels(raw, threshold_max=300e-6, threshold_length=0.5):
     ch_names = np.array(raw.ch_names)
     max_scores = np.array([np.mean(np.abs(data[idx]) > threshold_max) for idx, ch in enumerate(ch_names)])
     max_channels = ch_names[max_scores > threshold_length] 
+    del data
     return max_channels, max_scores
 
 def search_bridge_cluster(raw, threshold=0.99, method='auto'):
@@ -197,6 +201,8 @@ def search_bridge_cluster(raw, threshold=0.99, method='auto'):
     elif method =='ed':
         bridged_idx, ed_matrix = compute_bridged_electrodes(raw, verbose=False)
         figs = []
+        import matplotlib
+        matplotlib.use('Agg')
         fig = mne.viz.plot_bridged_electrodes(
             raw.info,
             bridged_idx,
@@ -393,25 +399,39 @@ class ENDetector():
 
 
 def DNC_SN_ratio(raw, noise_threshold=0.85, n_jobs=1):  
+    from mne.channels.interpolation import _make_interpolation_matrix
+    raw.load_data()                         # без копии
+    original_data = raw._data               # view / memmap
     ch_names = raw.ch_names
-    original_data = raw.get_data()
+    n_ch = len(ch_names)
+
+    pos_all = raw._get_channel_positions(np.arange(n_ch))
+    origin = np.zeros(3)                    # как в _interpolate_bads_eeg()
+
+    from mne.surface import _normalize_vectors
+    pos_all_sph = pos_all - origin
+    _normalize_vectors(pos_all_sph)
+
+    interp_info = []
+    for bad_idx in range(n_ch):
+        good_idx = np.delete(np.arange(n_ch), bad_idx)
+        W = _make_interpolation_matrix(pos_all_sph[good_idx],   # pos_from
+                                       pos_all_sph[[bad_idx]])  # pos_to
+        interp_info.append((good_idx, W.ravel()))               # 1×n_good
+    # ----------------------------------------------------------------
 
     def process_channel(ch_idx):
-        ch_name = ch_names[ch_idx]
-        raw_channel = raw.copy().load_data()
-        raw_channel.pick(ch_names)
-        raw_channel.info['bads'] = [ch_name]
-        noised_data = original_data[ch_idx, :].copy()
-        raw_channel.interpolate_bads(reset_bads=False, verbose=False)
-        interpolated_data = raw_channel.get_data(picks=[ch_name])[0] # signal
-        noise_data = noised_data - interpolated_data # noise
-        _, snr_db = compute_snr(interpolated_data, noise_data)
-        return ch_name, snr_db
+        """Чистая реализация interpolate_bads для одного канала."""
+        good_idx, w = interp_info[ch_idx]           # готовые веса
+        interp_sig = w @ original_data[good_idx]    # 1×T   (без копии)
+        noise = original_data[ch_idx] - interp_sig
+        _, snr_db = compute_snr(interp_sig, noise)
+        return ch_names[ch_idx], snr_db
 
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(process_channel)(ch_idx) for ch_idx in range(len(ch_names))
+    results = Parallel(n_jobs=n_jobs, timeout=None)(
+        delayed(process_channel)(i) for i in range(len(ch_names))
     )
-    
+
     snr_probabilities = {}
     bad_channels = []
     scores = []
@@ -436,7 +456,6 @@ def DNC_SN_ratio(raw, noise_threshold=0.85, n_jobs=1):
     fig.text(1.1, 0.5, noisy_text, va='center', ha='left', fontsize=10)
     plt.close(fig)
     return bad_channels, scores, fig
-
 
 def DNC_corr(raw, threshold_corr=0.65, threshold_perc=5):
     correlations = calculate_correlations(raw)
@@ -506,73 +525,77 @@ def DNC_ransac(raw):
 
 
 def compared_spectrum(inst1, inst2, fmin=0, fmax=100):
-    psd_before = inst1.compute_psd(fmin=fmin, fmax=fmax, remove_dc=False, verbose=False)
-    psd_after = inst2.compute_psd(fmin=fmin, fmax=fmax, remove_dc=False, verbose=False)
+    try:
+        psd_before = inst1.compute_psd(fmin=fmin, fmax=fmax, remove_dc=False, verbose=False)
+        psd_after = inst2.compute_psd(fmin=fmin, fmax=fmax, remove_dc=False, verbose=False)
 
-    if isinstance(inst1, mne.Epochs) and isinstance(inst2, mne.Epochs):
-        psd_before = psd_before.average()
-        psd_after = psd_after.average()
+        if isinstance(inst1, mne.Epochs) and isinstance(inst2, mne.Epochs):
+            psd_before = psd_before.average()
+            psd_after = psd_after.average()
 
-    bands = {'Delta': (0.5, 4), 'Theta': (4, 8), 'Alpha': (8, 13),
-            'Beta': (13, 30), 'Gamma': (30, 80)}
-    
-    data_before = psd_before.get_data() * 1e12
-    data_after  = psd_after.get_data()  * 1e12
-
-    data_before_clean = np.where(data_before > 0, data_before, np.nan) 
-    data_after_clean  = np.where(data_after  > 0, data_after,  np.nan) 
-
-    mean_psd_before = 10 * np.log10(data_before_clean)
-    mean_psd_after  = 10 * np.log10(data_after_clean)
-
-    freqs = psd_before.freqs
-    psd_list = [mean_psd_before, mean_psd_after]
-    titles = ['Spectrum before', 'Spectrum after']
-    colors = ['b', 'g']
-
-    all_vals = np.concatenate([
-        mean_psd_before.flatten(),
-        mean_psd_after.flatten()
-    ])
-    fin = all_vals[np.isfinite(all_vals)]
-    if fin.size:
-        ymin = np.floor(fin.min() / 10) * 10
-        ymax = np.ceil (fin.max() / 10) * 10
-    else:
-        ymin, ymax = -100, 0  # какие-то разумные дефолтные границы, если всё NaN
-    
-    fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=False)
-  
-    for idx, (mean_psd, title, color) in enumerate(zip(psd_list, titles, colors)):
-        ax = axs[idx]
-        y_mean = np.nanmean(mean_psd, axis=0)
-        y_std = np.nanstd(mean_psd, axis=0)
+        bands = {'Delta': (0.5, 4), 'Theta': (4, 8), 'Alpha': (8, 13),
+                'Beta': (13, 30), 'Gamma': (30, 80)}
         
-        ax.plot(freqs, y_mean, color=color)
-        ax.fill_between(freqs, y_mean - y_std, y_mean + y_std, color=color, alpha=0.3)
-        ax.set_title(title)
-        ax.set_ylabel('PSD (dB/V/Hz)')
-        ax.grid(True)
-          
-        band_powers = {}
-        for band_name, (fmin, fmax) in bands.items():
-            idx_band = np.logical_and(freqs >= fmin, freqs <= fmax)
-            band_power = np.nanmean(y_mean[idx_band])
-            band_powers[band_name] = band_power
-                 
-            ax.axvline(fmin, color='red', linestyle='--', linewidth=1)
-            ax.axvline(fmax, color='red', linestyle='--', linewidth=1)
-            ax.fill_betweenx([ymin, ymax], fmin, fmax, color='grey', alpha=0.05)
-              
-            ax.text((fmin + fmax) / 2, ymax - 2, f"{band_name}\n{band_power:.1f} dB",
-                    horizontalalignment='center', verticalalignment='top', fontsize=9, zorder=4)
-        
-        ax.set_ylim(ymin, ymax)
-        ax.set_xlim(freqs.min(), freqs.max())
-        ax.set_xticks(np.arange(freqs.min(), freqs.max()+1, 2))
-        ax.set_yticks(np.arange(ymin, ymax+1, 5))
-        ax.set_xlabel('Frequency (Hz)')
+        data_before = psd_before.get_data() * 1e12
+        data_after  = psd_after.get_data()  * 1e12
 
-    plt.tight_layout()
-    plt.close(fig)
+        data_before_clean = np.where(data_before > 0, data_before, np.nan) 
+        data_after_clean  = np.where(data_after  > 0, data_after,  np.nan) 
+
+        mean_psd_before = 10 * np.log10(data_before_clean)
+        mean_psd_after  = 10 * np.log10(data_after_clean)
+
+        freqs = psd_before.freqs
+        psd_list = [mean_psd_before, mean_psd_after]
+        titles = ['Spectrum before', 'Spectrum after']
+        colors = ['b', 'g']
+
+        all_vals = np.concatenate([
+            mean_psd_before.flatten(),
+            mean_psd_after.flatten()
+        ])
+        fin = all_vals[np.isfinite(all_vals)]
+        if fin.size:
+            ymin = np.floor(fin.min() / 10) * 10
+            ymax = np.ceil (fin.max() / 10) * 10
+        else:
+            ymin, ymax = -100, 0  # какие-то разумные дефолтные границы, если всё NaN
+        
+        fig, axs = plt.subplots(2, 1, figsize=(14, 10), sharex=False)
+    
+        for idx, (mean_psd, title, color) in enumerate(zip(psd_list, titles, colors)):
+            ax = axs[idx]
+            y_mean = np.nanmean(mean_psd, axis=0)
+            y_std = np.nanstd(mean_psd, axis=0)
+            
+            ax.plot(freqs, y_mean, color=color)
+            ax.fill_between(freqs, y_mean - y_std, y_mean + y_std, color=color, alpha=0.3)
+            ax.set_title(title)
+            ax.set_ylabel('PSD (dB/V/Hz)')
+            ax.grid(True)
+            
+            band_powers = {}
+            for band_name, (fmin, fmax) in bands.items():
+                idx_band = np.logical_and(freqs >= fmin, freqs <= fmax)
+                band_power = np.nanmean(y_mean[idx_band])
+                band_powers[band_name] = band_power
+                    
+                ax.axvline(fmin, color='red', linestyle='--', linewidth=1)
+                ax.axvline(fmax, color='red', linestyle='--', linewidth=1)
+                ax.fill_betweenx([ymin, ymax], fmin, fmax, color='grey', alpha=0.05)
+                
+                ax.text((fmin + fmax) / 2, ymax - 2, f"{band_name}\n{band_power:.1f} dB",
+                        horizontalalignment='center', verticalalignment='top', fontsize=9, zorder=4)
+            
+            ax.set_ylim(ymin, ymax)
+            ax.set_xlim(freqs.min(), freqs.max())
+            ax.set_xticks(np.arange(freqs.min(), freqs.max()+1, 2))
+            ax.set_yticks(np.arange(ymin, ymax+1, 5))
+            ax.set_xlabel('Frequency (Hz)')
+
+        plt.tight_layout()
+        plt.close(fig)
+    except Exception as e:
+        print(f"Error in compared_spectrum: {e}")
+        fig = None
     return fig

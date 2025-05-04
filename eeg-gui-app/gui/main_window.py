@@ -1,13 +1,17 @@
-# gui/main_window.py
+from __future__ import annotations
 
+import sys, json, hashlib, shutil, traceback, pickle
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib.figure import Figure
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QHBoxLayout, QPushButton, QStackedWidget, QLabel,
-    QFileDialog, QMessageBox
+    QApplication, QMainWindow, QDialog, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QStackedWidget, QFileDialog, QMessageBox, QTextEdit, QProgressBar
 )
-from PyQt5.QtCore import Qt
-import sys
-import json
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
+
 from gui.slides.slide1_intro import Slide1Intro
 from gui.slides.slide2_file_selection import Slide2FileSelection
 from gui.slides.slide3_qc import Slide3QC
@@ -15,152 +19,155 @@ from gui.slides.slide4_preprocessing import Slide4Preprocessing
 from gui.slides.slide5_Classic_analysis import Slide5Analysis
 from gui.slides.slide6_ML_analysis import Slide6MLAnalysis
 from gui.slides.slide7_results import Slide7Results
+from gui.save_project import SaveProgressWindow, SaveWorker, load_figure_pickle
+import os 
 
+
+# -------------------- MainWindow --------------------
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, project_dir=None):
         super().__init__()
         self.setWindowTitle("EEG Auto Tools GUI")
         self.setGeometry(100, 100, 1200, 800)
+        self.project_dir = Path(project_dir) if project_dir else None
 
-        # Центральный виджет
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        self.save_thread = None
+        self.save_worker = None
 
-        # Основной макет
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
 
-        # Стек виджетов для слайдов
         self.stack = QStackedWidget()
-        main_layout.addWidget(self.stack)
+        layout.addWidget(self.stack)
 
-        # Инициализация слайдов
+        nav_layout = QHBoxLayout()
+        layout.addLayout(nav_layout)
+
+        titles = ["Manual", "DataBase", "QC", "Preprocessing", "Classic Analysis", "ML Analysis", "Dataset Stats"]
+        for i, title in enumerate(titles):
+            btn = QPushButton(title)
+            btn.clicked.connect(lambda _, index=i: self.navigate_to(index))
+            nav_layout.addWidget(btn)
+
+        save_btn = QPushButton("Сохранить проект")
+        save_btn.clicked.connect(self.save_project)
+        nav_layout.addWidget(save_btn)
+
+        load_btn = QPushButton("Загрузить проект")
+        load_btn.clicked.connect(lambda: self.load_project())
+        nav_layout.addWidget(load_btn)
+        self._init_slides() 
+
+    def _init_slides(self):
+        if self.project_dir:
+            cache_dir = self.project_dir / "cache"
+            cache_dir.mkdir(exist_ok=True)
+
         self.slides = [
-            Slide1Intro(),
-            Slide2FileSelection(),
-            Slide3QC(),
-            Slide4Preprocessing(),
-            Slide5Analysis(),
-            Slide6MLAnalysis(),
-            Slide7Results()
+            Slide1Intro(), Slide2FileSelection(), Slide3QC(cache_dir=str(cache_dir)), Slide4Preprocessing(),
+            Slide5Analysis(), Slide6MLAnalysis(), Slide7Results()
         ]
-        self.slides_names = ["Manual", "DataBase", "QC", "Preprocessing", "Classic Analysis", "ML Analysis", "Dataset Stats"]
-
         for slide in self.slides:
             self.stack.addWidget(slide)
-
-        # Навигационная панель
-        nav_layout = QHBoxLayout()
-        main_layout.addLayout(nav_layout)
-
-        self.nav_buttons = []
-        for i, slide_name in enumerate(self.slides_names):
-            btn = QPushButton(slide_name)
-            btn.setCheckable(True)
-            btn.clicked.connect(lambda checked, index=i: self.navigate_to(index))
-            nav_layout.addWidget(btn)
-            self.nav_buttons.append(btn)
-
-        # Кнопки для сохранения и загрузки проекта
-        self.save_button = QPushButton("Сохранить проект")
-        self.save_button.clicked.connect(self.save_project)
-        nav_layout.addWidget(self.save_button)
-
-        self.load_button = QPushButton("Загрузить проект")
-        self.load_button.clicked.connect(self.load_project)
-        nav_layout.addWidget(self.load_button)
-
         self.navigate_to(0)
 
+    def initialize_project(self, folder: Path):
+        self.project_dir = folder
+        if not hasattr(self, "slides") or not self.slides:
+            self._init_slides()
+        else:
+            self.navigate_to(0)
+            
     def navigate_to(self, index):
         self.stack.setCurrentIndex(index)
-        for i, btn in enumerate(self.nav_buttons):
-            btn.setChecked(i == index)
 
-    def save_project(self):
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить проект", "", "EEG Project Files (*.eegproj)"
-        )
-        if not file_path:
-            return
+    def _collect_state(self):
+        table = self.slides[1].table
+        figures_map = {}
+        figures_data = {}
 
-        # Собираем данные со всех слайдов
-        project_data = {
-            "slides": {}
+        for fpath, colmap in table.data_storage.items():
+            for col, val in colmap.items():
+                if isinstance(val, Figure):
+                    uid = hashlib.sha1(fpath.encode()).hexdigest()[:8]
+                    rel_path = f"{uid}/{col}.pkl"
+                    figures_map.setdefault(fpath, {})[col] = rel_path
+                    figures_data.setdefault(fpath, {})[col] = val
+
+        slides_state = {}
+        for idx, slide in enumerate(self.slides):
+            key = f"slide{idx+1}"
+            if hasattr(slide, "serialize"):
+                slides_state[key] = slide.serialize()
+            else:
+                slides_state[key] = {}
+
+        return {
+            "slides": slides_state,
+            "figures": figures_map,
+            "figures_data": figures_data,
         }
 
-        # Slide1Intro (ничего не сохраняем, так как это статический слайд)
-        project_data["slides"]["slide1"] = {}
+    def save_project(self):
+        if not self.project_dir:
+            folder = QFileDialog.getExistingDirectory(self, "Выберите папку для проекта")
+            if not folder:
+                return
+            self.initialize_project(Path(folder))
 
-        # Slide2FileSelection
-        project_data["slides"]["slide2"] = self.slides[1].serialize()
+        state = self._collect_state()
+        progress = SaveProgressWindow()
+        progress.show()
 
-        # Slide3QC
-        project_data["slides"]["slide3"] = self.slides[2].serialize()
+        self.save_thread = QThread()
+        self.save_worker = SaveWorker(self.project_dir, state, progress)
+        self.save_worker.moveToThread(self.save_thread)
 
-        # Slide4Preprocessing (пока заглушка, добавим позже)
-        project_data["slides"]["slide4"] = self.slides[3].serialize() if hasattr(self.slides[3], 'serialize') else {}
+        self.save_worker.done.connect(lambda status, msg: (progress.finish(msg), self.save_thread.quit()))
+        self.save_thread.finished.connect(self._on_save_finished)
 
-        # Slide5Analysis, Slide6MLAnalysis, Slide7Results (заглушки)
-        project_data["slides"]["slide5"] = self.slides[4].serialize() if hasattr(self.slides[4], 'serialize') else {}
-        project_data["slides"]["slide6"] = self.slides[5].serialize() if hasattr(self.slides[5], 'serialize') else {}
-        project_data["slides"]["slide7"] = self.slides[6].serialize() if hasattr(self.slides[6], 'serialize') else {}
+        self.save_thread.started.connect(self.save_worker.run)
+        self.save_thread.start()
 
-        # Сохраняем проект в файл
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(project_data, f, indent=4)
-            QMessageBox.information(self, "Успех", "Проект успешно сохранён!")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить проект: {e}")
+    def _on_save_finished(self):
+        self.save_thread = None
+        self.save_worker = None
 
-    def load_project(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Загрузить проект", "", "EEG Project Files (*.eegproj)"
-        )
-        if not file_path:
+    def load_project(self, folder=None):
+        if folder is None:
+            folder = QFileDialog.getExistingDirectory(self, "Выберите папку проекта")
+            if not folder:
+                return
+        folder = Path(folder)
+        self.initialize_project(folder)
+
+        project_json = folder / "project.json"
+        figures_dir = folder / "figures"
+
+        if not project_json.exists():
+            QMessageBox.critical(self, "Ошибка", "Файл project.json не найден!")
             return
 
-        # Загружаем данные из файла
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                project_data = json.load(f)
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить проект: {e}")
-            return
+        with open(project_json, encoding="utf-8") as f:
+            state = json.load(f)
 
-        # Очищаем текущие данные всех слайдов
-        for slide in self.slides:
-            if hasattr(slide, 'clear'):
-                slide.clear()
+        figures = state.get("figures", {})
+        for fpath, colmap in figures.items():
+            for col, rel_path in colmap.items():
+                fig_path = figures_dir / rel_path
+                if fig_path.exists():
+                    fig = load_figure_pickle(fig_path)
+                    self.slides[1].table.set_data(fpath, col, fig)
+                else:
+                    print(f"LOG: Фигура {fig_path} не найдена при загрузке проекта.")
 
-        # Загружаем данные в слайды
-        if "slides" in project_data:
-            # Slide2FileSelection
-            if "slide2" in project_data["slides"]:
-                self.slides[1].deserialize(project_data["slides"]["slide2"])
+        self._apply_state(state)
+        QMessageBox.information(self, "Готово", "Проект успешно загружен!")
 
-            # Slide3QC
-            if "slide3" in project_data["slides"]:
-                self.slides[2].deserialize(project_data["slides"]["slide3"])
-
-            # Slide4Preprocessing (пока заглушка)
-            if "slide4" in project_data["slides"] and hasattr(self.slides[3], 'deserialize'):
-                self.slides[3].deserialize(project_data["slides"]["slide4"])
-
-            # Slide5Analysis, Slide6MLAnalysis, Slide7Results (заглушки)
-            if "slide5" in project_data["slides"] and hasattr(self.slides[4], 'deserialize'):
-                self.slides[4].deserialize(project_data["slides"]["slide5"])
-            if "slide6" in project_data["slides"] and hasattr(self.slides[5], 'deserialize'):
-                self.slides[5].deserialize(project_data["slides"]["slide6"])
-            if "slide7" in project_data["slides"] and hasattr(self.slides[6], 'deserialize'):
-                self.slides[6].deserialize(project_data["slides"]["slide7"])
-
-        QMessageBox.information(self, "Успех", "Проект успешно загружен!")
-
-# Точка входа
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+    def _apply_state(self, state: dict):
+        slides = state.get("slides", {})
+        for idx, slide in enumerate(self.slides):
+            key = f"slide{idx+1}"
+            if key in slides and hasattr(slide, "deserialize"):
+                slide.deserialize(slides[key])
