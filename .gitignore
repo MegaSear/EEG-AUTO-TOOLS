@@ -1,2 +1,5 @@
-eeg_auto_tools\cleaning_models\ART.onnx
+./eeg_auto_tools/cleaning_models/ART.onnx
 **/__pycache__
+./eeg-model-train/checkpoint.pth.tar
+./eeg-model-train/my_checkpoint.pth
+./eeg-model-train/DatasetInfo.csv
