@@ -101,7 +101,6 @@ class Worker(QObject):
                             "params": dict(node.params),
                             "status": status
                         }
-                        # Отправляем через сигнал
                         self.log.emit({
                             "file": file,
                             "path_id": path_id,
@@ -123,6 +122,8 @@ class Worker(QObject):
                                 if os.path.exists(cache_base):
                                     update_log(file, path_idx, node, "Cache Reading")
                                     current_raw = self._load_cached_raw(cache_base)
+                                    cached_repo_data, cached_repo_images = self._load_cached_report(file, hash_value, node.name)
+                                    update_report(node.name, cached_repo_data, cached_repo_images)
                                     update_log(file, path_idx, node, "Cache Readed")
                                     if current_raw:
                                         continue
@@ -131,6 +132,7 @@ class Worker(QObject):
                                 update_report(node.name, repo_data, repo_images)
                                 update_log(file, path_idx, node, "Caching")
                                 self._cache_raw(processed, file, hash_value, node.name, node.params)
+                                self._cache_report(file, hash_value, node.name, repo_data, repo_images)
                                 update_log(file, path_idx, node, "Computed")
                             except Exception as e:
                                 update_log(file, path_idx, node, "Failed")
@@ -139,6 +141,7 @@ class Worker(QObject):
                                 return
                     
                     reports_per_file[file] = file_report
+                    self.progress.emit(f"✅ Обработка файла завершена: {file})")
                 self.finished.emit(reports_per_file, transform_names, logs)
 
     def _cache_raw(self, raw, file_path, hash_value, node_name, params):
@@ -154,10 +157,11 @@ class Worker(QObject):
                 params_json = json.dumps(params, ensure_ascii=False)
                 f.create_dataset('params', data=params_json.encode('utf-8'), dtype=ch_names_dt)
             return cache_file
+        
         except Exception as e:
             print(f"Ошибка кэширования: {e}")
             return None
-        
+    
     def _load_cached_raw(self, cache_file):
         if not self._verify_cache(cache_file):
             print(f"Кэш повреждён или неполный: {cache_file}")
@@ -170,6 +174,53 @@ class Worker(QObject):
         except Exception as e:
             print(f"Ошибка загрузки кэша: {e}")
             return None
+
+    def sanitize_for_json(self, obj):
+        if isinstance(obj, dict):
+            return {k: self.sanitize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.sanitize_for_json(v) for v in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.integer, np.floating)):
+            return obj.item()
+        elif isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        else:
+            return str(obj)
+
+    def _cache_report(self, file_path, hash_value, node_name, repo_data, repo_images):
+        report_file = os.path.join(self.cache_dir, f"{os.path.basename(file_path)}_{hash_value}_{node_name}_report.json")
+        figures_dir = Path(self.cache_dir) / f"{os.path.basename(file_path)}_{hash_value}_{node_name}_figures"
+        figures_dir.mkdir(parents=True, exist_ok=True)
+
+        sanitized_data = self.sanitize_for_json(repo_data)
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(sanitized_data, f, ensure_ascii=False, indent=2)
+
+        for key, fig in repo_images.items():
+            fig_path = figures_dir / f"{key}.pkl"
+            with open(fig_path, 'wb') as f_out:
+                pickle.dump(fig, f_out)
+
+    def _load_cached_report(self, file_path, hash_value, node_name):
+        report_file = os.path.join(self.cache_dir, f"{os.path.basename(file_path)}_{hash_value}_{node_name}_report.json")
+        figures_dir = Path(self.cache_dir) / f"{os.path.basename(file_path)}_{hash_value}_{node_name}_figures"
+
+        repo_data = {}
+        repo_images = {}
+
+        if os.path.exists(report_file):
+            with open(report_file, 'r', encoding='utf-8') as f:
+                repo_data = json.load(f)
+
+        if figures_dir.exists():
+            for fig_file in figures_dir.glob("*.pkl"):
+                key = fig_file.stem
+                with open(fig_file, 'rb') as f_in:
+                    repo_images[key] = pickle.load(f_in)
+
+        return repo_data, repo_images
 
     def _verify_cache(self, cache_file):
         if not h5py.is_hdf5(cache_file):

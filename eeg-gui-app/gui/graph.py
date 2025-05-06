@@ -1,7 +1,7 @@
 from PyQt5.QtWidgets import (
     QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem, QGraphicsPathItem,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QGraphicsItem, QPushButton,
-    QFileDialog, QMessageBox, QComboBox, QHBoxLayout, QVBoxLayout, QWidget
+    QFileDialog, QMessageBox, QComboBox, QHBoxLayout, QVBoxLayout, QWidget, QLabel, QFrame
 )
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QBrush, QColor, QPen, QPainterPath
@@ -47,11 +47,9 @@ class TransformBlock(QGraphicsRectItem):
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
 
     def _get_default_params(self):
-        return {
-            k: v.default if v.default is not inspect.Parameter.empty else ""
-            for k, v in inspect.signature(self.transform_class.__init__).parameters.items()
-            if k != "self"
-        }
+        if hasattr(self.transform_class, "get_parameters_schema"):
+            return {k: v["default"] for k, v in self.transform_class.get_parameters_schema().items()}
+        return {}
 
     def _setup_ui(self, name):
         self.setBrush(QBrush(COLORS["input_block" if name == "InputRaw" else "transform_block"]))
@@ -98,7 +96,7 @@ class TransformBlock(QGraphicsRectItem):
 class TransformParamDialog(QDialog):
     def __init__(self, name, params):
         super().__init__()
-        self.setWindowTitle(f"Параметры: {name}")
+        self.setWindowTitle(f"Параметры {name}:")
         self.inputs = {}
         self.name = name
         self.plotter = None
@@ -107,71 +105,256 @@ class TransformParamDialog(QDialog):
     def _setup_ui(self, params):
         main_layout = QHBoxLayout(self)
 
+        transform_class = get_available_transforms().get(self.name, Transform)
+        schema = transform_class.get_parameters_schema() if hasattr(transform_class, "get_parameters_schema") else {}
+        description = getattr(transform_class, "DESCRIPTION", None)
+
+        if description:
+            description_frame = QFrame()
+            description_frame.setStyleSheet("""
+                QFrame {
+                    background-color: #f8f8f8;
+                    border: 1px solid #ccc;
+                    border-left: 5px solid #409eff;
+                    padding: 0px 0px 0px 0px;
+                    border-radius: 4px;
+                }
+            """)
+
+            description_layout = QVBoxLayout(description_frame)
+            description_layout.setContentsMargins(0, 0, 0, 0)
+            description_layout.setSpacing(0)
+
+            # Заголовок "Описание:"
+            title_label = QLabel("Описание:")
+            title_label.setStyleSheet("""
+                QLabel {
+                    font-weight: bold;
+                    font-size: 14px;
+                    color: #409eff;
+                }
+            """)
+            title_label.setFrameStyle(QFrame.NoFrame)
+            title_label.setAttribute(Qt.WA_TranslucentBackground)
+            description_layout.addWidget(title_label)
+
+            # Текст описания
+            description_label = QLabel(description)
+            description_label.setWordWrap(True)
+            description_label.setStyleSheet("""
+                QLabel {
+                    color: #222;
+                    font-size: 12px;
+                    line-height: 150%;
+                    padding-left: 12px;
+                }
+            """)
+            description_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            description_label.setFrameStyle(QFrame.NoFrame)
+            description_label.setAttribute(Qt.WA_TranslucentBackground)
+            description_layout.addWidget(description_label)
+
+            # Сделаем контейнер немного шире
+            description_frame.setMinimumWidth(380)
+
+            main_layout.addWidget(description_frame)
+
         form_widget = QWidget()
         layout = QFormLayout(form_widget)
+        for key, value in params.items():
+            param_info = schema.get(key, {"type": type(value), "default": value})
+            param_type = param_info.get("type")
+
+            if self.name == "SetMontage" and key == "montage":
+                # Специальная обработка для монтажа
+                self.standard_montage = QComboBox()
+                for choice in param_info.get("choices", []):
+                    self.standard_montage.addItem(str(choice))
+                self.standard_montage.setCurrentText(str(value))
+                layout.addRow("Montage", self.standard_montage)
+
+                # Монтажный режим
+                self.montage_mode = QComboBox()
+                self.montage_mode.addItems(["Standard Montage", "ELC File"])
+                layout.addRow("Режим монтажа", self.montage_mode)
+
+                self.montage_mode.currentTextChanged.connect(self._update_montage_mode_ui)
+
+            elif self.name == "SetMontage" and key == "elc_file":
+                # Поле для выбора elc файла
+                elc_layout = QHBoxLayout()
+                self.elc_line = QLineEdit(str(value) if value else "")
+                elc_browse = QPushButton("...")
+                elc_browse.setFixedWidth(30)
+
+                def browse_elc():
+                    file_path, _ = QFileDialog.getOpenFileName(self, "Выбрать .elc файл", "", "ELC файлы (*.elc)")
+                    if file_path:
+                        self.elc_line.setText(file_path)
+                        print(f"Выбран elc файл: {file_path}")
+
+                elc_browse.clicked.connect(browse_elc)
+                elc_layout.addWidget(self.elc_line)
+                elc_layout.addWidget(elc_browse)
+                elc_container = QWidget()
+                elc_container.setLayout(elc_layout)
+                layout.addRow("ELC File", elc_container)
+                self.elc_container = elc_container  # сохраним чтобы скрывать/показывать
+
+            else:
+                # Обычные параметры
+                if param_type == "choice" and "choices" in param_info:
+                    combo = QComboBox()
+                    for choice in param_info["choices"]:
+                        combo.addItem(str(choice))
+                    combo.setCurrentText(str(value))
+                    layout.addRow(key, combo)
+                    self.inputs[key] = combo
+                elif param_type == bool:
+                    combo = QComboBox()
+                    combo.addItems(["True", "False"])
+                    combo.setCurrentText(str(value))
+                    layout.addRow(key, combo)
+                    self.inputs[key] = combo
+                elif param_type == "file":
+                    file_layout = QHBoxLayout()
+                    line_edit = QLineEdit(str(value) if value else "")
+                    browse_button = QPushButton("...")
+                    browse_button.setFixedWidth(30)
+
+                    def make_browse(line_edit_widget):
+                        def browse_file():
+                            file_path, _ = QFileDialog.getOpenFileName(self, "Выбрать файл", "", "Все файлы (*)")
+                            if file_path:
+                                line_edit_widget.setText(file_path)
+                                print(f"Выбран файл: {file_path}")
+                        return browse_file
+
+                    browse_button.clicked.connect(make_browse(line_edit))
+                    file_layout.addWidget(line_edit)
+                    file_layout.addWidget(browse_button)
+                    container = QWidget()
+                    container.setLayout(file_layout)
+                    layout.addRow(key, container)
+                    self.inputs[key] = line_edit
+                else:
+                    line_edit = QLineEdit(str(value))
+                    layout.addRow(key, line_edit)
+                    self.inputs[key] = line_edit
 
         if self.name == "SetMontage":
-            montage_combo = QComboBox()
-            montage_combo.addItems(mne.channels.get_builtin_montages() + ["waveguard64"])
-            montage_combo.setCurrentText(params.get("montage", "waveguard64"))
-            layout.addRow("Montage", montage_combo)
-            self.inputs["montage"] = montage_combo
-
-            elc_edit = QLineEdit(params.get("elc_file", ""))
-            elc_button = QPushButton("Load .elc")
-            elc_button.clicked.connect(self.load_elc)
-            layout.addRow("ELC File", elc_edit)
-            layout.addRow("", elc_button)
-            self.inputs["elc_file"] = elc_edit
-
-            # --- Теперь динамически добавляем все остальные параметры ---
-            for key, value in params.items():
-                if key in {"montage", "elc_file"}:
-                    continue  # Эти уже обработаны отдельно
-                line_edit = QLineEdit(str(value))
-                layout.addRow(key, line_edit)
-                self.inputs[key] = line_edit
-
-            check_button = QPushButton("Check")
+            # 3D Preview
+            check_button = QPushButton("Check Montage")
             check_button.clicked.connect(self.visualize_montage)
-            layout.addRow("", check_button)
-            
-        elif self.name == "RenameChannels":
-            for key, value in params.items():
-                line_edit = QLineEdit(str(value))
-                layout.addRow(key, line_edit)
-                self.inputs[key] = line_edit
-                if key == "channel_mapping":
-                    load_button = QPushButton("Load Mapping")
-                    load_button.clicked.connect(self.load_mapping)
-                    layout.addRow("", load_button)
-        else:
-            for key, value in params.items():
-                line_edit = QLineEdit(str(value))
-                layout.addRow(key, line_edit)
-                self.inputs[key] = line_edit
+            layout.addRow(check_button)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        main_layout.addWidget(form_widget)
-
-        if self.name == "SetMontage":
             self.viz_widget = QWidget()
             self.viz_widget.setLayout(QVBoxLayout())
-            main_layout.addWidget(self.viz_widget)
+            layout.addRow(self.viz_widget)
 
             from pyvistaqt import QtInteractor
             self.plotter = QtInteractor(self.viz_widget)
             self.viz_widget.layout().addWidget(self.plotter)
             self.plotter.set_background('white')
-        else:
-            self.plotter = None
-            self.viz_widget = None
 
+            self._update_montage_mode_ui()
 
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        main_layout.addWidget(form_widget)
+
+    def _update_montage_mode_ui(self):
+        if hasattr(self, 'elc_container'):
+            if self.montage_mode.currentText() == "ELC File":
+                self.standard_montage.hide()
+                self.elc_container.show()
+            else:
+                self.standard_montage.show()
+                self.elc_container.hide()
+
+    def visualize_montage(self):
+        if self.plotter is None:
+            return
+        try:
+            import mne
+            import pyvista
+            import numpy as np
+
+            if self.montage_mode.currentText() == "ELC File":
+                elc_file = self.elc_line.text()
+                if not elc_file:
+                    QMessageBox.critical(self, "Ошибка", "Файл ELC не выбран!")
+                    return
+                ch_dict, nasion, lpa, rpa, hsp = read_elc(elc_file)
+                montage = mne.channels.make_dig_montage(ch_pos=ch_dict, nasion=nasion, lpa=lpa, rpa=rpa, hsp=hsp, coord_frame='head')
+            elif self.standard_montage.currentText() == "waveguard64":
+                montage = create_custom_montage("waveguard64")
+            else:
+                montage = mne.channels.make_standard_montage(self.standard_montage.currentText())
+
+            self.plotter.clear()
+            pos = montage.get_positions()
+            if pos and 'ch_pos' in pos:
+                coords = np.array(list(pos['ch_pos'].values()))
+                point_cloud = pyvista.PolyData(coords)
+                glyph = point_cloud.glyph(scale=False, geom=pyvista.Sphere(radius=0.003), orient=False)
+                self.plotter.add_mesh(glyph, color='red', smooth_shading=True)
+                labels = list(pos['ch_pos'].keys())
+                self.plotter.add_point_labels(coords, labels, point_size=10, font_size=14, always_visible=True, shape=None, text_color='black')
+
+            self.plotter.reset_camera()
+            self.plotter.update()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось визуализировать монтаж: {e}")
+
+    def get_params(self):
+        params = {}
+        transform_class = get_available_transforms().get(self.name, Transform)
+        schema = transform_class.get_parameters_schema() if hasattr(transform_class, "get_parameters_schema") else {}
+
+        for key, field in self.inputs.items():
+            param_info = schema.get(key, {})
+            param_type = param_info.get("type")
+
+            if isinstance(field, QComboBox):
+                val = field.currentText()
+                if param_type == bool:
+                    val = val == "True"
+                elif param_type == "choice":
+                    choices = param_info.get("choices", [])
+                    if all(isinstance(c, (int, float)) for c in choices):
+                        val = float(val) if "." in val else int(val)
+                params[key] = val
+            else:
+                text = field.text()
+                try:
+                    if param_type == int:
+                        params[key] = int(text)
+                    elif param_type == float:
+                        params[key] = float(text)
+                    elif param_type == bool:
+                        params[key] = text.lower() == "true"
+                    elif param_type == tuple:
+                        params[key] = eval(text)
+                    else:
+                        params[key] = text
+                except Exception:
+                    params[key] = text
+
+        if self.name == "SetMontage":
+            if self.montage_mode.currentText() == "ELC File":
+                params["montage"] = "personal"
+                params["elc_file"] = self.elc_line.text()
+            else:
+                params["montage"] = self.standard_montage.currentText()
+                params["elc_file"] = None
+
+        return params
+
+    
     def load_mapping(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Выберите файл маппинга", "",
@@ -205,69 +388,6 @@ class TransformParamDialog(QDialog):
                 return mapping
         else:
             raise ValueError("Неподдерживаемый формат файла. Используйте JSON или CSV.")
-
-    def load_elc(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select .elc file", "", "ELC Files (*.elc)")
-        if file_path:
-            self.inputs["elc_file"].setText(file_path)
-
-    def visualize_montage(self):
-        if self.plotter is None:
-            return  # Если нет plotter, ничего не делать
-
-        try:
-            import mne
-            import pyvista
-            import numpy as np 
-
-            montage_name = self.inputs["montage"].currentText()
-            elc_file = self.inputs["elc_file"].text()
-
-            if elc_file:
-                montage = read_elc(elc_file)
-            else:
-                montage = mne.channels.make_standard_montage(montage_name) if montage_name != "waveguard64" else create_custom_montage("waveguard64")
-
-            # Очистить старую сцену
-            self.plotter.clear()
-
-            # Добавить новые сферы и подписи
-            pos = montage.get_positions()
-            if pos and 'ch_pos' in pos:
-                coords = np.array(list(pos['ch_pos'].values()))
-                point_cloud = pyvista.PolyData(coords)
-                glyph = point_cloud.glyph(scale=False, geom=pyvista.Sphere(radius=0.003), orient=False)
-                self.plotter.add_mesh(glyph, color='red', smooth_shading=True)
-
-                labels = list(pos['ch_pos'].keys())
-                self.plotter.add_point_labels(
-                    coords, labels,
-                    point_size=10,
-                    font_size=14,
-                    text_color='black',
-                    shape=None,
-                    always_visible=True
-                )
-
-            self.plotter.reset_camera()
-            self.plotter.update()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось визуализировать монтаж: {e}")
-
-
-    def get_params(self):
-        params = {}
-        for key, field in self.inputs.items():
-            if isinstance(field, QComboBox):
-                params[key] = field.currentText()
-            else:
-                text = field.text()
-                try:
-                    params[key] = eval(text)
-                except Exception:
-                    params[key] = text
-        return params
 
 class Edge(QGraphicsPathItem):
     def __init__(self, start_item, end_item):

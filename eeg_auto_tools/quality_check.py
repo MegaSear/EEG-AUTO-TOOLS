@@ -68,12 +68,10 @@ def compute_bad_epochs(epochs, snr_matrix, roi_channels=None, thr_auto=True):
         
     rej_dict['FINAL'] = sorted(list(combined_indices))
     rej_dict['Percentage_removed_trials'] = len(rej_dict['FINAL'])/epochs._data.shape[0]*100
-    #for key in rej_dict.keys():
-    #    print(f'rej_dict[{key}] = {rej_dict[key]}')
     return rej_dict
 
-def set_montage(raw, montage, elc_file, mode, threshold, verbose=False, interpolate=None, vis=None):
-    if montage=='waveguard64':
+def set_montage(raw, montage, elc_file, mode, threshold, interpolate=None):
+    if montage == 'waveguard64':
         montage = create_custom_montage(montage)
     elif montage == 'personal':
         ch_dict, nasion, lpa, rpa, hsp = read_elc(elc_file)
@@ -85,14 +83,6 @@ def set_montage(raw, montage, elc_file, mode, threshold, verbose=False, interpol
         montage = mne.channels.make_standard_montage(montage)
     
     raw.set_montage(montage, verbose=False)
-
-    if vis:
-        fig = montage.plot(show_names=True, kind='3d')
-        for ax in fig.get_axes():
-            if ax.name == '3d':
-                ax.set_xlim([-0.1, 0.1])
-                ax.set_ylim([-0.1, 0.1])
-                ax.set_zlim([-0.1, 0.1])
     return raw
 
 def DNC_lof(raw):
@@ -132,7 +122,7 @@ def detect_bad_channels(raw, method_noise='auto', method_bridge='auto', n_jobs=4
         bad_channels, scores, noised_fig = DNC_corr(interpolated_raw)
     elif method_noise == 'lof':
         bad_channels, scores, noised_fig = DNC_lof(interpolated_raw)
-    elif method_noise in ['auto', 'SN_ratio']:
+    elif method_noise in ['auto', 'snr']:
         bad_channels, scores, noised_fig = DNC_SN_ratio(interpolated_raw, n_jobs=n_jobs)
     else:
         raise ValueError(f"Unknown method_noise '{method_noise}'. Please use 'ransac', 'neighbours', 'psd', 'ed', 'corr' or 'auto'")
@@ -163,7 +153,7 @@ def get_highamp_channels(raw, threshold_max=300e-6, threshold_length=0.5):
 def search_bridge_cluster(raw, threshold=0.99, method='auto'):
     data = raw.get_data()
     ch_names = raw.ch_names
-    if method in ['corr', 'auto']:
+    if method == 'corr':
         corr_matrix = np.corrcoef(data)
 
         #heuristics
@@ -198,7 +188,7 @@ def search_bridge_cluster(raw, threshold=0.99, method='auto'):
                      for j in range(i+1, binary_matrix.shape[1])
                      if binary_matrix[i, j] == 1]
 
-    elif method =='ed':
+    elif method in ['auto', 'ed']:
         bridged_idx, ed_matrix = compute_bridged_electrodes(raw, verbose=False)
         figs = []
         import matplotlib

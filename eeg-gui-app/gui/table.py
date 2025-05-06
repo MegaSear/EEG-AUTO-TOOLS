@@ -20,7 +20,6 @@ TABLE_COLUMNS = [
 base_columns = [TABLE_COLUMNS[i]["label"] for i in range(8)]
 
 def normalize_path(path):
-    """Нормализовать путь (абсолютный + нормализованный + без чувствительности к регистру для Windows)."""
     return os.path.normcase(os.path.abspath(path))
 
 class FileTableWidget(QTableWidget):
@@ -69,21 +68,17 @@ class FileTableWidget(QTableWidget):
     def add_row(self, file_path, data=None):
         if self.has_file(file_path):
             return None
-
         row = self.rowCount()
         self.insertRow(row)
         self.data_files.append(file_path)
-
         if file_path not in self.data_storage:
             self.data_storage[file_path] = {}
-
         if data:
             for col, value in enumerate(data):
                 if col < self.columnCount():
                     align = Qt.AlignCenter if col >= self.columnCount() - 2 else Qt.AlignLeft
                     is_link = value == "View"
                     self.set_elem(row, col, value, align, is_link=is_link)
-
         return row
 
     def add_column(self, label, align=Qt.AlignCenter):
@@ -98,21 +93,14 @@ class FileTableWidget(QTableWidget):
         return col
 
     def remove_file(self, file_path):
-        """Убрать файл из data_files, data_storage, logs и таблицы."""
         norm_path = normalize_path(file_path)
-
-        # Найти index по нормализованному пути
         for idx, existing_path in enumerate(self.data_files):
             if normalize_path(existing_path) == norm_path:
                 break
         else:
             return  # Файл не найден → ничего не делаем
-
-        # Удаляем строку таблицы
         self.removeRow(idx)
         self.data_files.pop(idx)
-
-        # Удаляем данные
         if existing_path in self.data_storage:
             for col_name, value in self.data_storage[existing_path].items():
                 if isinstance(value, Figure):
@@ -122,14 +110,12 @@ class FileTableWidget(QTableWidget):
         if existing_path in self.logs:
             del self.logs[existing_path]
 
-            
     def remove_selected_rows(self):
         selected_rows = sorted(set(index.row() for index in self.selectedIndexes()), reverse=True)
         for row in selected_rows:
             if row < len(self.data_files):
                 file_path = self.data_files[row]
                 self.remove_file(file_path)
-
 
     def handle_item_clicked(self, item):
         if item.text() == "View":
