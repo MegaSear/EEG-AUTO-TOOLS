@@ -876,6 +876,7 @@ class SetMontage(Transform):
     '''
     PARAMETERS = {
         "montage": {"type": "choice", "default": "waveguard64", "choices": mne.channels.get_builtin_montages() + ["waveguard64", "personal"]},   
+        "elc_file": {"type": "str", "default": None},
         "mode": {"type": str, "default": "Cz"},   
         "threshold": {"type": float, "default": 0.08},  
         "interpolate": {"type": bool, "default": True}, 
